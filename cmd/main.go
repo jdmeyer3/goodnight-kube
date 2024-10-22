@@ -144,8 +144,8 @@ func main() {
 	reconciler := &controller.GoodnightDeploymentReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
-		WatchList: controller.WatchList{
-			Deployments: make(map[string]appsv1.Deployment),
+		SleepList: controller.SleepList{
+			SleepyDeployments: make(map[string]controller.SleepyDeployment),
 		},
 	}
 

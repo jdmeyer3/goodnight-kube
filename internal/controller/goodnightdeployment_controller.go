@@ -18,9 +18,13 @@ package controller
 
 import (
 	"context"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/samber/lo"
+	"github.com/spf13/cast"
 	appsv1 "k8s.io/api/apps/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -31,16 +35,37 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 )
 
+const (
+	TimeLayout = "15:04"
+
+	GoodnightPrefix = "goodnight.joshmeyer.dev"
+
+	AwakeTimeLabel     = "goodnight.joshmeyer.dev/awake-time"
+	AwakeReplicasLabel = "goodnight.joshmeyer.dev/awake-replicas"
+	SleepTimeLabel     = "goodnight.joshmeyer.dev/sleep-time"
+	SleepReplicasLabel = "goodnight.joshmeyer.dev/sleep-replicas"
+
+	IsSleepingLabel = "goodnight.joshmeyer.dev/sleeping"
+)
+
 // GoodnightDeploymentReconciler reconciles a GoodnightDeployment object
 type GoodnightDeploymentReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
-	WatchList
+	SleepList
 }
 
-type WatchList struct {
+type SleepList struct {
 	sync.RWMutex
-	Deployments map[string]appsv1.Deployment
+	SleepyDeployments map[string]SleepyDeployment
+}
+
+type SleepyDeployment struct {
+	Deployment    *appsv1.Deployment
+	AwakeTime     time.Time
+	AwakeReplicas int32
+	SleepTime     time.Time
+	SleepReplicas int32
 }
 
 // +kubebuilder:rbac:groups=goodnight-kube.joshmeyer.dev,resources=goodnightdeployments,verbs=get;list;watch;create;update;patch;delete
@@ -63,7 +88,7 @@ func (r *GoodnightDeploymentReconciler) Reconcile(ctx context.Context, req ctrl.
 	err := r.Get(ctx, req.NamespacedName, deployment)
 	if err != nil {
 		if errors.IsNotFound(err) {
-			delete(r.Deployments, req.Name)
+			delete(r.SleepyDeployments, req.Name)
 			return ctrl.Result{}, nil
 		} else {
 			log.Error(err, "failed to retrieve deployment")
@@ -72,14 +97,23 @@ func (r *GoodnightDeploymentReconciler) Reconcile(ctx context.Context, req ctrl.
 	}
 	r.Lock()
 	defer r.Unlock()
-	if hasAnnotation(deployment) {
-		r.Deployments[req.Name] = *deployment
-		log.Info("adding deployment to watch list")
-	} else if _, ok := r.Deployments[req.Name]; ok {
-		log.Info("removing deployment from watch list")
-		delete(r.Deployments, req.Name)
-	}
+	s, isSleepy := loadSleepyDeployment(ctx, deployment)
+	_, loadedDeployment := r.SleepyDeployments[req.Name]
 
+	if !isSleepy {
+		if loadedDeployment {
+			log.Info("removing deployment from watch list", "deployment", req.Name)
+			delete(r.SleepyDeployments, req.Name)
+		}
+		return ctrl.Result{}, nil
+	}
+	if !loadedDeployment {
+		log.Info("adding deployment to watch list", "deployment", req.Name)
+	} else {
+		log.Info("updating deployment in watch list", "deployment", req.Name)
+	}
+	r.SleepyDeployments[req.Name] = s
+	r.EnterSandman(ctx, s)
 	return ctrl.Result{}, err
 }
 
@@ -90,13 +124,13 @@ func (r *GoodnightDeploymentReconciler) SetupWithManager(mgr ctrl.Manager) error
 		For(&appsv1.Deployment{}).
 		WithEventFilter(predicate.Funcs{
 			CreateFunc: func(e event.CreateEvent) bool {
-				return hasAnnotation(e.Object)
+				return hasGoodnightAnnotation(e.Object)
 			},
 			UpdateFunc: func(e event.UpdateEvent) bool {
-				return hasAnnotation(e.ObjectOld)
+				return hasGoodnightAnnotation(e.ObjectOld)
 			},
 			DeleteFunc: func(e event.DeleteEvent) bool {
-				return hasAnnotation(e.Object)
+				return hasGoodnightAnnotation(e.Object)
 			},
 		}).
 		Complete(r)
@@ -114,13 +148,18 @@ func (r *GoodnightDeploymentReconciler) LoadDeployments(ctx context.Context) {
 	}
 
 	for _, d := range deployments.Items {
-		if !hasAnnotation(&d) {
+		if !hasGoodnightAnnotation(&d) {
 			continue
 		}
 		r.Lock()
 		defer r.Unlock()
 		log.Info("Loading deployment", "name", d.Name)
-		r.Deployments[d.Name] = d
+		s, isSleepy := loadSleepyDeployment(ctx, &d)
+		if isSleepy {
+			r.SleepyDeployments[d.Name] = s
+		} else {
+
+		}
 	}
 }
 
@@ -135,36 +174,123 @@ func (r *GoodnightDeploymentReconciler) Monitor(ctx context.Context) {
 		case <-ticker.C:
 			log.Info("checking if the deployments are sleepy")
 			r.RLock()
-			defer r.RUnlock()
 
-			for _, d := range r.Deployments {
-				log.Info("Deployment", "name", d.Name, "time", timeAnnotation(ctx, &d, "goodnight.joshmeyer.dev/managed-by"))
+			for _, d := range r.SleepyDeployments {
+				err := r.EnterSandman(ctx, d)
+				if err != nil {
+					log.Error(err, "failed to handle deployment", "deployment", d.Deployment.Name)
+				}
 			}
+			r.RUnlock()
 		case <-ctx.Done():
 			return
 		}
 	}
 }
 
-func hasAnnotation(e client.Object) bool {
-	annotations := e.GetAnnotations()
-	if value, ok := annotations["goodnight.joshmeyer.dev/managed-by"]; ok {
-		return value == "true"
+func (r *GoodnightDeploymentReconciler) EnterSandman(ctx context.Context, s SleepyDeployment) error {
+	log := log.FromContext(ctx)
+	t := time.Now()
+	ns, _ := time.Parse(TimeLayout, strconv.Itoa(t.Hour())+":"+strconv.Itoa(t.Minute()))
+
+	isBedTime := inTimeSpan(s.SleepTime, s.AwakeTime, ns)
+	targetReplicas := s.AwakeReplicas
+	if isBedTime {
+		targetReplicas = s.SleepReplicas
+	}
+	if (isBedTime && lo.FromPtr(s.Deployment.Spec.Replicas) == targetReplicas) || (!isBedTime && lo.FromPtr(s.Deployment.Spec.Replicas) == targetReplicas) {
+		return nil
+	}
+
+	s.Deployment.Spec.Replicas = &targetReplicas
+	s.Deployment.Annotations[IsSleepingLabel] = cast.ToString(isBedTime)
+	if isBedTime {
+		log.Info("putting deployment to sleep", "deployment", s.Deployment.Name)
+	} else {
+		log.Info("waking deployment up", "deployment", s.Deployment.Name)
+	}
+	return r.Client.Update(ctx, s.Deployment)
+}
+
+func hasGoodnightAnnotation(e client.Object) bool {
+	for k := range e.GetAnnotations() {
+		if strings.HasPrefix(k, GoodnightPrefix) {
+			return true
+		}
 	}
 	return false
 }
 
-func timeAnnotation(ctx context.Context, e client.Object, annotation string) time.Time {
-	log := log.FromContext(ctx)
+func loadSleepyDeployment(ctx context.Context, deployment *appsv1.Deployment) (SleepyDeployment, bool) {
+	logger := log.FromContext(ctx)
 
-	annotations := e.GetAnnotations()
-	if value, ok := annotations[annotation]; ok {
-		t, err := time.Parse(value, time.TimeOnly)
-		if err != nil {
-			log.Error(err, "unable to parse sleep time", "annotation", annotation)
-			return time.Time{}
-		}
-		return t
+	annotations := deployment.GetAnnotations()
+
+	sleepTime, err := timeAnnotation(annotations, SleepTimeLabel)
+	if err != nil {
+		logger.Error(err, "failed to parse annotation", "annotation", SleepTimeLabel)
+		return SleepyDeployment{}, false
 	}
-	return time.Time{}
+
+	sleepReplicas, err := replicaAnnotation(annotations, SleepReplicasLabel)
+	if err != nil {
+		logger.Error(err, "failed to parse annotation", "annotation", SleepReplicasLabel)
+		return SleepyDeployment{}, false
+	}
+
+	awakeTime, err := timeAnnotation(annotations, AwakeTimeLabel)
+	if err != nil {
+		logger.Error(err, "failed to parse annotation", "annotation", AwakeTimeLabel)
+		return SleepyDeployment{}, false
+	}
+
+	awakeReplicas, err := replicaAnnotation(annotations, AwakeReplicasLabel)
+	if err != nil {
+		logger.Error(err, "failed to parse annotation", "annotation", AwakeReplicasLabel)
+		return SleepyDeployment{}, false
+	}
+
+	if !sleepTime.IsZero() && !awakeTime.IsZero() {
+		return SleepyDeployment{
+			Deployment:    deployment,
+			AwakeTime:     awakeTime,
+			AwakeReplicas: awakeReplicas,
+			SleepTime:     sleepTime,
+			SleepReplicas: sleepReplicas,
+		}, true
+	}
+
+	return SleepyDeployment{}, false
+}
+
+func timeAnnotation(annotations map[string]string, label string) (time.Time, error) {
+	if value, ok := annotations[label]; ok {
+		t, err := time.Parse(TimeLayout, value)
+		if err != nil {
+			return time.Time{}, err
+		}
+		return t, nil
+	}
+	return time.Time{}, errors.NewBadRequest("missing annotation")
+}
+
+func replicaAnnotation(annotations map[string]string, label string) (int32, error) {
+	if value, ok := annotations[label]; ok {
+		t, err := strconv.Atoi(value)
+		if err != nil {
+			return 0, err
+		}
+		return int32(t), err
+	}
+	return 0, errors.NewBadRequest("missing annotation")
+}
+
+func inTimeSpan(start, end, check time.Time) bool {
+	if start.Before(end) {
+		return !check.Before(start) && !check.After(end)
+	}
+	if start.Equal(end) {
+		return check.Equal(start)
+	}
+	return !start.After(check) || !end.Before(check)
 }

@@ -1,0 +1,24 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx-project
+  annotations:
+    "goodnight.joshmeyer.dev/sleep-replicas": "1"
+    "goodnight.joshmeyer.dev/awake-replicas": "5"
+    "goodnight.joshmeyer.dev/sleep-time": "15:04"
+    "goodnight.joshmeyer.dev/awake-time": "15:05"
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: nginx-project
+  template:
+    metadata:
+      labels:
+        app: nginx-project
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:1.17.3
+          ports:
+            - containerPort: 80
